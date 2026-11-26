@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="쇼츠 에디터">
+<meta name="theme-color" content="#0b0d12">
+<meta name="description" content="40초 쇼츠·릴스 전용 세로(9:16) 웹 영상편집기. 설치 없이 브라우저에서 바로 편집하고 내보내세요.">
+<title>쇼츠 에디터 · 40초 세로 영상 편집기</title>
+<link rel="stylesheet" href="style.css">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="icon" type="image/png" href="icon-192.png">
+</head>
+<body>
+<div id="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">▶</span>
+      <span class="brandText">쇼츠 에디터</span>
+    </div>
+
+    <div class="limitBox" id="limitBox">
+      <div class="limitTop">
+        <strong id="totalDuration">0.0초</strong>
+        <span class="muted">/ 40초</span>
+      </div>
+      <div class="limitBar"><div id="limitFill"></div></div>
+    </div>
+    <div class="limitWarn" id="limitWarn" hidden>⚠️ 40초 초과</div>
+
+    <div class="topActions">
+      <button class="btn ghost" id="btnAddTop" title="영상 파일 추가">+ 영상</button>
+      <button class="btn accent" id="btnExportTop">내보내기</button>
+    </div>
+    <input type="file" id="fileInput" accept="video/*,.mp4,.mov,.webm,.m4v" multiple hidden>
+  </header>
+
+  <main class="stage">
+    <!-- ============ 미리보기 ============ -->
+    <section class="previewWrap">
+      <div class="previewFrame" id="previewFrame">
+        <div class="canvasBox" id="canvasBox">
+          <canvas id="previewCanvas" width="540" height="960"></canvas>
+
+          <div class="safeZone" id="safeZone" hidden aria-hidden="true">
+            <div class="szTop">상단 UI 영역</div>
+            <div class="szRight">
+              <div class="szIcon">♥</div>
+              <div class="szIcon">💬</div>
+              <div class="szIcon">↗</div>
+            </div>
+            <div class="szBottom">
+              <div class="szCaption">@내계정 · 캡션 영역</div>
+              <div class="szMusic">♫ 원본 오디오</div>
+            </div>
+            <div class="szLabel">세이프존 (내보내기에는 안 들어가요)</div>
+          </div>
+        </div>
+
+        <div class="previewEmpty" id="previewEmpty">
+          <div class="peIcon">🎬</div>
+          <p><strong>영상을 추가해 시작하세요</strong></p>
+          <p class="muted">MP4 · MOV · WebM 을 끌어다 놓거나<br>아래 버튼을 눌러 주세요</p>
+          <button class="btn primary" id="btnAddEmpty">+ 영상 추가</button>
+        </div>
+      </div>
+
+      <div class="transport">
+        <button class="iconBtn" id="btnPlay" title="재생/일시정지">▶</button>
+        <button class="iconBtn small" id="btnBack" title="1초 뒤로">«</button>
+        <span class="timeNow" id="timeNow">0:00.0</span>
+        <input type="range" id="scrub" class="scrub" min="0" max="1" step="0.01" value="0" aria-label="재생 위치">
+        <button class="chip" id="btnSafe" title="쇼츠·릴스 세이프존 가이드">세이프존</button>
+        <button class="chip" id="btnLoop" title="반복 재생">반복</button>
+      </div>
+
+      <div class="timeline" id="timeline">
+        <div class="tlRow tlClips" id="tlClips"></div>
+        <div class="tlRow tlCaps" id="tlCaps"></div>
+        <div class="tlPlayhead" id="tlPlayhead"></div>
+        <div class="tlEmpty" id="tlEmpty">타임라인</div>
+      </div>
+    </section>
+
+    <!-- ============ 편집 패널 ============ -->
+    <aside class="inspector">
+      <nav class="tabs" id="tabs">
+        <button data-tab="clips" class="active">클립</button>
+        <button data-tab="captions">자막</button>
+        <button data-tab="audio">사운드</button>
+        <button data-tab="style">스타일</button>
+        <button data-tab="export">내보내기</button>
+      </nav>
+
+      <div class="panes" id="panes">
+
+        <!-- ---------- 클립 ---------- -->
+        <section class="pane active" data-pane="clips">
+          <div class="paneHead">
+            <h3>클립 <span class="muted" id="clipCount">0개</span></h3>
+            <button class="btn small" id="btnAddClip">+ 영상 추가</button>
+          </div>
+          <div id="clipList" class="clipList"></div>
+          <div id="clipProps" class="clipProps"></div>
+
+          <div class="card">
+            <div class="cardTitle">클립 전환 · 페이드</div>
+            <div class="segRow" id="transitionRow">
+              <button class="seg" data-trans="none">없음</button>
+              <button class="seg" data-trans="fade">디졸브</button>
+            </div>
+            <label class="sliderRow">
+              <span>전환 길이</span>
+              <input type="range" id="transDur" min="0" max="1" step="0.05" value="0.4">
+              <output id="transDurOut">0.4초</output>
+            </label>
+            <label class="sliderRow">
+              <span>시작 페이드 인</span>
+              <input type="range" id="fadeIn" min="0" max="2" step="0.1" value="0">
+              <output id="fadeInOut">0초</output>
+            </label>
+            <label class="sliderRow">
+              <span>끝 페이드 아웃</span>
+              <input type="range" id="fadeOut" min="0" max="2" step="0.1" value="0">
+              <output id="fadeOutOut">0초</output>
+            </label>
+          </div>
+        </section>
+
+        <!-- ---------- 자막 ---------- -->
+        <section class="pane" data-pane="captions">
+          <div class="paneHead">
+            <h3>자막 <span class="muted" id="capCount">0개</span></h3>
+            <button class="btn small" id="btnAddCap">+ 자막</button>
+          </div>
+
+          <div class="card">
+            <div class="cardTitle">
+              상단 후킹 제목
+              <label class="switch"><input type="checkbox" id="titleOn"><span></span></label>
+            </div>
+            <input class="input" id="titleText" type="text" maxlength="40" placeholder="예) 3일 만에 5kg? 진짜 방법">
+            <div class="row2">
+              <label>노출
+                <select id="titleMode">
+                  <option value="all">영상 전체</option>
+                  <option value="intro">초반만</option>
+                </select>
+              </label>
+              <label>크기
+                <input type="range" id="titleSize" min="20" max="56" step="1" value="34">
+              </label>
+            </div>
+            <div class="row2" id="titleRange">
+              <label>시작 <input type="number" id="titleStart" min="0" step="0.1" value="0"></label>
+              <label>끝 <input type="number" id="titleEnd" min="0" step="0.1" value="3"></label>
+            </div>
+            <div class="row2">
+              <label>글자색 <input type="color" id="titleColor" value="#ffffff"></label>
+              <label>배경 <input type="color" id="titleBg" value="#7c5cff"></label>
+            </div>
+            <p class="hint">제목을 켜면 영상 위에 배지 형태로 표시돼요.</p>
+          </div>
+
+          <div id="capList" class="capList"></div>
+          <p class="hint" id="capEmptyHint">자막이 없습니다. ‘+ 자막’을 눌러 추가해 보세요.</p>
+        </section>
+
+        <!-- ---------- 사운드 ---------- -->
+        <section class="pane" data-pane="audio">
+          <div class="card">
+            <div class="cardTitle">원본 영상 소리</div>
+            <label class="sliderRow">
+              <span>볼륨</span>
+              <input type="range" id="videoVol" min="0" max="150" step="1" value="100">
+              <output id="videoVolOut">100%</output>
+            </label>
+            <p class="hint">클립별 소리를 한 번에 조절해요. 0%면 원본 소리는 나오지 않아요.</p>
+          </div>
+
+          <div class="card">
+            <div class="cardTitle">배경음악 (BGM)</div>
+            <div class="fileRow">
+              <button class="btn small" id="btnBgmPick">음악 파일 선택</button>
+              <span class="fileName" id="bgmName">선택 안 함</span>
+              <button class="btn small ghost" id="btnBgmClear">제거</button>
+            </div>
+            <input type="file" id="bgmInput" accept="audio/*" hidden>
+            <label class="sliderRow">
+              <span>BGM 볼륨</span>
+              <input type="range" id="bgmVol" min="0" max="150" step="1" value="60">
+              <output id="bgmVolOut">60%</output>
+            </label>
+            <div class="row2">
+              <label>페이드 인 <input type="number" id="bgmFadeIn" min="0" max="10" step="0.5" value="0.5"></label>
+              <label>페이드 아웃 <input type="number" id="bgmFadeOut" min="0" max="10" step="0.5" value="1"></label>
+            </div>
+            <p class="hint">영상보다 짧은 음악은 자동으로 반복돼요. 저작권 없는 음원을 사용해 주세요.</p>
+          </div>
+
+          <div class="card">
+            <div class="cardTitle">미리듣기</div>
+            <label class="checkRow"><input type="checkbox" id="mutePreview"> 소리 끄고 미리보기</label>
+          </div>
+        </section>
+
+        <!-- ---------- 스타일 ---------- -->
+        <section class="pane" data-pane="style">
+          <div class="card">
+            <div class="cardTitle">9:16 세로 화면 맞추기</div>
+            <div class="segRow" id="fillRow">
+              <button class="seg" data-fill="cover">꽉 채우기</button>
+              <button class="seg" data-fill="contain">여백 + 블러</button>
+              <button class="seg" data-fill="containColor">여백 + 단색</button>
+            </div>
+            <label class="sliderRow">
+              <span>좌우 위치</span>
+              <input type="range" id="offX" min="-50" max="50" step="1" value="0">
+              <output id="offXOut">0</output>
+            </label>
+            <label class="sliderRow">
+              <span>상하 위치</span>
+              <input type="range" id="offY" min="-50" max="50" step="1" value="0">
+              <output id="offYOut">0</output>
+            </label>
+            <div class="row2">
+              <label>여백 색 <input type="color" id="bgColor" value="#000000"></label>
+              <button class="btn small ghost" id="btnResetFit">위치 초기화</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="cardTitle">색감 필터</div>
+            <div class="filterRow" id="filterRow"></div>
+          </div>
+
+          <div class="card">
+            <div class="cardTitle">전체 배속</div>
+            <div class="segRow" id="speedRow">
+              <button class="seg" data-speed="0.5">0.5x</button>
+              <button class="seg" data-speed="0.75">0.75x</button>
+              <button class="seg" data-speed="1">1x</button>
+              <button class="seg" data-speed="1.5">1.5x</button>
+              <button class="seg" data-speed="2">2x</button>
+            </div>
+            <p class="hint">클립별 배속(클립 탭)에 곱해져요. 전체 시간과 40초 표시가 바로 바뀝니다.</p>
+          </div>
+
+          <div class="card">
+            <div class="cardTitle">가이드</div>
+            <label class="checkRow"><input type="checkbox" id="safeToggle"> 쇼츠·릴스 세이프존 표시</label>
+            <p class="hint">좋아요·댓글 아이콘과 캡션 영역을 겹쳐 보여줘요. 미리보기에만 나오고 영상에는 안 들어갑니다.</p>
+          </div>
+        </section>
+
+        <!-- ---------- 내보내기 ---------- -->
+        <section class="pane" data-pane="export">
+          <div class="card">
+            <div class="cardTitle">내보내기 설정</div>
+            <div class="row2">
+              <label>해상도
+                <select id="expRes">
+                  <option value="540">540 × 960 (가벼움)</option>
+                  <option value="720" selected>720 × 1280 (추천)</option>
+                  <option value="1080">1080 × 1920 (고화질)</option>
+                </select>
+              </label>
+              <label>프레임
+                <select id="expFps">
+                  <option value="24">24fps</option>
+                  <option value="30" selected>30fps</option>
+                </select>
+              </label>
+            </div>
+            <ul class="expSummary" id="expSummary"></ul>
+            <button class="btn accent wide" id="btnExport">영상 내보내기</button>
+            <p class="hint">내보내는 동안 화면을 켜 두고 이 탭을 유지해 주세요. 실제 재생 속도로 녹화돼요.</p>
+          </div>
+
+          <div class="card" id="resultCard" hidden>
+            <div class="cardTitle">완성된 영상</div>
+            <video id="resultVideo" controls playsinline class="resultVideo"></video>
+            <div class="row2">
+              <a class="btn accent" id="btnDownload" download>다운로드</a>
+              <button class="btn ghost" id="btnExportAgain">다시 내보내기</button>
+            </div>
+            <p class="hint" id="resultInfo"></p>
+          </div>
+
+          <div class="card">
+            <div class="cardTitle">사용 팁</div>
+            <ol class="tips">
+              <li>아이폰 사진은 ‘사진 앱 → 공유 → 파일에 저장’ 후 불러오면 가장 안정적이에요.</li>
+              <li>영상이 세로가 아니면 ‘스타일 → 꽉 채우기’에서 위치를 미세 조정하세요.</li>
+              <li>40초를 넘으면 쇼츠·릴스에서 잘릴 수 있어요. 상단 표시를 확인하세요.</li>
+              <li>내보낸 파일은 브라우저 다운로드 폴더에 저장됩니다.</li>
+            </ol>
+          </div>
+        </section>
+
+      </div>
+    </aside>
+  </main>
+</div>
+
+<!-- 진행 오버레이 -->
+<div class="modal" id="exportModal" hidden>
+  <div class="modalCard">
+    <h3 id="expModalTitle">영상 내보내는 중…</h3>
+    <div class="bar"><div id="expBar"></div></div>
+    <p class="modalStatus" id="expStatus">준비 중…</p>
+    <p class="hint">탭을 닫거나 다른 앱으로 이동하면 내보내기가 중단될 수 있어요.</p>
+    <div class="modalActions">
+      <button class="btn ghost" id="expCancel">중단</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+<div id="videoBank" class="videoBank" aria-hidden="true"></div>
+
+<noscript><p class="noscript">이 편집기는 자바스크립트가 필요합니다. 브라우저 설정에서 자바스크립트를 켜 주세요.</p></noscript>
+<script src="app.js"></script>
+</body>
+</html>
