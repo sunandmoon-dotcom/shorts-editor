@@ -9,7 +9,7 @@
 <meta name="theme-color" content="#0b0d12">
 <meta name="description" content="40초 쇼츠·릴스 전용 세로(9:16) 웹 영상편집기. 설치 없이 브라우저에서 바로 편집하고 내보내세요.">
 <title>쇼츠 에디터 · 40초 세로 영상 편집기</title>
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="style.css?v=2">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" href="icon-192.png">
 <link rel="icon" type="image/png" href="icon-192.png">
@@ -18,6 +18,7 @@
 <div id="app">
 
   <header class="topbar">
+
     <div class="brand">
       <span class="logo">▶</span>
       <span class="brandText">쇼츠 에디터</span>
@@ -33,10 +34,11 @@
     <div class="limitWarn" id="limitWarn" hidden>⚠️ 40초 초과</div>
 
     <div class="topActions">
-      <button class="btn ghost" id="btnAddTop" title="영상 파일 추가">+ 영상</button>
-      <button class="btn accent" id="btnExportTop">내보내기</button>
+      <label class="btn ghost addFileBtn" id="btnAddTop" title="영상 파일 추가">+ 영상
+        <input class="fileInput" id="fileInputTop" type="file" accept="video/*,.mp4,.mov,.webm,.m4v" multiple>
+      </label>
+      <button class="btn accent" id="btnExportTop" type="button">내보내기</button>
     </div>
-    <input type="file" id="fileInput" accept="video/*,.mp4,.mov,.webm,.m4v" multiple hidden>
   </header>
 
   <main class="stage">
@@ -65,7 +67,9 @@
           <div class="peIcon">🎬</div>
           <p><strong>영상을 추가해 시작하세요</strong></p>
           <p class="muted">MP4 · MOV · WebM 을 끌어다 놓거나<br>아래 버튼을 눌러 주세요</p>
-          <button class="btn primary" id="btnAddEmpty">+ 영상 추가</button>
+          <label class="btn primary addFileBtn" id="btnAddEmpty">+ 영상 추가
+            <input class="fileInput" id="fileInputEmpty" type="file" accept="video/*,.mp4,.mov,.webm,.m4v" multiple>
+          </label>
         </div>
       </div>
 
@@ -102,7 +106,9 @@
         <section class="pane active" data-pane="clips">
           <div class="paneHead">
             <h3>클립 <span class="muted" id="clipCount">0개</span></h3>
-            <button class="btn small" id="btnAddClip">+ 영상 추가</button>
+            <label class="btn small addFileBtn" id="btnAddClip">+ 영상 추가
+              <input class="fileInput" id="fileInputClip" type="file" accept="video/*,.mp4,.mov,.webm,.m4v" multiple>
+            </label>
           </div>
           <div id="clipList" class="clipList"></div>
           <div id="clipProps" class="clipProps"></div>
@@ -183,13 +189,31 @@
           </div>
 
           <div class="card">
-            <div class="cardTitle">배경음악 (BGM)</div>
-            <div class="fileRow">
-              <button class="btn small" id="btnBgmPick">음악 파일 선택</button>
-              <span class="fileName" id="bgmName">선택 안 함</span>
-              <button class="btn small ghost" id="btnBgmClear">제거</button>
+            <div class="cardTitle">무료 BGM <span class="cardTag">저작권 프리</span></div>
+            <div class="presetList" id="bgmPresets"></div>
+            <p class="hint">이 앱이 직접 만든 음악이라 인터넷·저작권 걱정이 없어요. ‘적용’을 누르면 BGM 트랙에 얹히고, 영상 내보내기에도 그대로 섞입니다.</p>
+          </div>
+
+          <div class="card">
+            <div class="cardTitle">무료 효과음 (SFX)</div>
+            <div class="presetList" id="sfxPresets"></div>
+            <div class="sfxAddRow">
+              <label>넣을 위치(초)<input type="number" id="sfxTime" min="0" step="0.1" value="0"></label>
+              <button class="btn small ghost" id="btnSfxNow" type="button">현재 위치</button>
             </div>
-            <input type="file" id="bgmInput" accept="audio/*" hidden>
+            <div class="sfxList" id="sfxList"></div>
+            <p class="hint" id="sfxEmptyHint">아직 넣은 효과음이 없어요. 위 효과음의 ‘추가’를 누르면 지금 위치에 들어가요.</p>
+          </div>
+
+          <div class="card">
+            <div class="cardTitle">내 음악 파일</div>
+            <div class="fileRow">
+              <label class="btn small addFileBtn" id="btnBgmPick">음악 파일 선택
+                <input class="fileInput" id="bgmInput" type="file" accept="audio/*,.mp3,.m4a,.wav,.aac,.ogg">
+              </label>
+              <span class="fileName" id="bgmName">선택 안 함</span>
+              <button class="btn small ghost" id="btnBgmClear" type="button">제거</button>
+            </div>
             <label class="sliderRow">
               <span>BGM 볼륨</span>
               <input type="range" id="bgmVol" min="0" max="150" step="1" value="60">
@@ -199,7 +223,7 @@
               <label>페이드 인 <input type="number" id="bgmFadeIn" min="0" max="10" step="0.5" value="0.5"></label>
               <label>페이드 아웃 <input type="number" id="bgmFadeOut" min="0" max="10" step="0.5" value="1"></label>
             </div>
-            <p class="hint">영상보다 짧은 음악은 자동으로 반복돼요. 저작권 없는 음원을 사용해 주세요.</p>
+            <p class="hint">영상보다 짧은 음악은 자동으로 반복돼요. 무료 BGM을 적용하면 이 파일 대신 그것이 쓰입니다.</p>
           </div>
 
           <div class="card">
@@ -324,6 +348,6 @@
 <div id="videoBank" class="videoBank" aria-hidden="true"></div>
 
 <noscript><p class="noscript">이 편집기는 자바스크립트가 필요합니다. 브라우저 설정에서 자바스크립트를 켜 주세요.</p></noscript>
-<script src="app.js"></script>
+<script src="app.js?v=2"></script>
 </body>
 </html>

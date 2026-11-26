@@ -65,7 +65,8 @@ const S = {
   captions: [],
   selectedCapId: null,
   title: { on: false, text: '', mode: 'all', start: 0, end: 3, size: 34, color: '#ffffff', bg: '#7c5cff' },
-  audio: { videoVolume: 1, bgmVolume: 0.6, bgmFadeIn: 0.5, bgmFadeOut: 1, bgmName: '', bgmUrl: '' },
+  audio: { videoVolume: 1, bgmVolume: 0.6, bgmFadeIn: 0.5, bgmFadeOut: 1, bgmName: '', bgmKind: '', bgmPreset: '' },
+  sfx: [],
   fillMode: 'cover',         // cover | contain
   bgMode: 'blur',            // blur | color
   bgColor: '#000000',
@@ -77,7 +78,17 @@ const S = {
   globalSpeed: 1
 };
 
-const A = { ctx: null, master: null, streamDest: null, bgmGain: null, bgmSrc: null, bgmEl: null };
+const A = { ctx: null, master: null, streamDest: null, bgmGain: null, sfxBus: null };
+/* AG: 타임라인 오디오(BGM·효과음) 재생 상태 */
+const AG = {
+  bgmBuffer: null,     // 지금 BGM 트랙의 오디오 버퍼(내장 생성 또는 내 파일 디코딩)
+  bgmKind: '',         // 'preset' | 'file' | ''
+  bgmKey: '',          // 내장 BGM 프리셋 키
+  bgmNode: null,       // 재생 중인 BGM 소스 노드
+  sfxNodes: [],        // 예약된 효과음 소스 노드
+  started: false,
+  wallStart: 0
+};
 const P = { playing: false, time: 0, base: 0, t0: 0, raf: 0, loop: false, muted: false };
 const X = { running: false, cancel: false, rec: null, raf: 0, cam: null };
 
@@ -103,6 +114,9 @@ function ensureAudio() {
     A.bgmGain = A.ctx.createGain();
     A.bgmGain.gain.value = 0;
     A.bgmGain.connect(A.master);
+    A.sfxBus = A.ctx.createGain();
+    A.sfxBus.gain.value = 1;
+    A.sfxBus.connect(A.master);
     return A.ctx;
   } catch (e) {
     A.ctx = null;
@@ -123,12 +137,6 @@ function attachVideoAudio(clip) {
 function attachAllAudio() {
   if (!A.ctx) return;
   S.clips.forEach(attachVideoAudio);
-  if (A.bgmEl && !A.bgmSrc) {
-    try {
-      A.bgmSrc = A.ctx.createMediaElementSource(A.bgmEl);
-      A.bgmSrc.connect(A.bgmGain);
-    } catch (e) { /* ignore */ }
-  }
 }
 function applyVideoVolume() {
   S.clips.forEach((c) => { if (c.__gain) c.__gain.gain.value = S.audio.videoVolume; });
@@ -141,6 +149,479 @@ function bgmFade(t) {
   return clamp(f, 0, 1);
 }
 
+/* ---------------- 3-2. 타임라인 오디오 재생(BGM + 효과음) ---------------- */
+function stopNode(n) {
+  if (!n) return;
+  try { n.stop(); } catch (e) {}
+  try { n.disconnect(); } catch (e) {}
+}
+function audioStop() {
+  if (AG.bgmNode) { stopNode(AG.bgmNode); AG.bgmNode = null; }
+  AG.sfxNodes.forEach(stopNode);
+  AG.sfxNodes = [];
+  AG.started = false;
+}
+
+/** 타임라인 t초부터 오디오를 켠다. 반환값은 그 시점의 performance.now() 기준 시각. */
+function audioStartAt(t, lead) {
+  const ctx = ensureAudio();
+  const now = performance.now();
+  if (!ctx) return now;
+  if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+  audioStop();
+  const wait = lead == null ? 0.04 : lead;
+  const startAt = ctx.currentTime + wait;
+  AG.started = true;
+  AG.wallStart = now + wait * 1000;
+
+  if (AG.bgmBuffer && AG.bgmBuffer.duration > 0.06) {
+    const src = ctx.createBufferSource();
+    src.buffer = AG.bgmBuffer;
+    src.loop = true;
+    src.connect(A.bgmGain);
+    const off = t % AG.bgmBuffer.duration;
+    try { src.start(startAt, clamp(off, 0, AG.bgmBuffer.duration - 0.001)); }
+    catch (e) { try { src.start(startAt); } catch (e2) {} }
+    AG.bgmNode = src;
+  }
+
+  // 앞으로 나올 효과음만 미리 예약(지나간 것은 울리지 않게)
+  S.sfx.forEach((ev) => {
+    if (ev.time < t - 0.02) return;
+    scheduleSfx(ev, startAt + Math.max(0, ev.time - t));
+  });
+  return AG.wallStart;
+}
+
+function scheduleSfx(ev, whenCtx) {
+  const ctx = A.ctx;
+  if (!ctx) return;
+  const buf = audioBufferFor('sfx:' + ev.key);
+  if (!buf) return;
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  const g = ctx.createGain();
+  g.gain.value = clamp(ev.vol == null ? 0.8 : ev.vol, 0, 2);
+  src.connect(g);
+  g.connect(A.sfxBus);
+  try { src.start(Math.max(ctx.currentTime, whenCtx)); } catch (e) { return; }
+  AG.sfxNodes.push(src);
+  src.onended = () => {
+    try { g.disconnect(); } catch (e) {}
+    const i = AG.sfxNodes.indexOf(src);
+    if (i >= 0) AG.sfxNodes.splice(i, 1);
+  };
+}
+
+/** 효과음 하나를 지금 바로 울린다(미리듣기). */
+function playSfxNow(key, vol) {
+  const ctx = ensureAudio();
+  if (!ctx) return;
+  if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+  const buf = audioBufferFor('sfx:' + key);
+  if (!buf) return;
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  const g = ctx.createGain();
+  g.gain.value = clamp(vol == null ? 0.8 : vol, 0, 2);
+  src.connect(g);
+  g.connect(A.sfxBus);
+  try { src.start(); } catch (e) { return; }
+  src.onended = () => { try { g.disconnect(); } catch (e) {} };
+}
+
+/* ---------------- 3-3. 내장 사운드 합성기 (외부 음원·네트워크 없이 100% 코드로 생성) ---------------- */
+const SR = 44100;
+const RAW = {};    // key → Float32Array (합성 결과)
+const ABUF = {};   // key → AudioBuffer (재생용 캐시)
+
+const NOTE_IDX = { C: 0, 'C#': 1, D: 2, 'D#': 3, E: 4, F: 5, 'F#': 6, G: 7, 'G#': 8, A: 9, 'A#': 10, B: 11 };
+function hz(name) {
+  const m = /^([A-G]#?)(-?\d)$/.exec(name);
+  if (!m) return 440;
+  const midi = (parseInt(m[2], 10) + 1) * 12 + NOTE_IDX[m[1]];
+  return 440 * Math.pow(2, (midi - 69) / 12);
+}
+
+/* 단음(오실레이터) 한 개를 버퍼에 더한다. harm=[[배음, 세기],...]으로 음색 결정
+   ※ 사인 테이블 + 곱셈 감쇠로 샘플당 exp·sin 호출 없이 처리(아이폰에서도 즉시 생성) */
+const SINE_N = 8192;
+const SINE = new Float32Array(SINE_N);
+for (let i = 0; i < SINE_N; i++) SINE[i] = Math.sin((2 * Math.PI * i) / SINE_N);
+const TAU = Math.PI * 2;
+
+function voice(buf, o) {
+  const t0 = Math.round((o.t || 0) * SR);
+  const dur = o.dur || 0.4;
+  const n = Math.round(dur * SR);
+  const f0 = o.f || 440;
+  const fEnd = o.f1 == null ? f0 : o.f1;
+  const amp = o.amp == null ? 0.2 : o.amp;
+  const attN = Math.max(1, Math.round((o.att == null ? 0.004 : o.att) * SR));
+  const decN = Math.max(1, (o.dec == null ? dur : o.dec) * SR);
+  const fall = Math.exp(-1 / decN);
+  const relN = o.rel ? Math.round(o.rel * SR) : 0;
+  const vib = o.vib || 0, vibStep = TAU * (o.vibRate || 5) / SR;
+  const harm = (o.harm && o.harm.length) ? o.harm : [[1, 1]];
+  const nh = harm.length;
+  const wrap = o.wrap !== false;
+  const len = buf.length;
+  const step = n > 1 && Math.abs(fEnd - f0) > 0.01 ? Math.pow(fEnd / f0, 1 / n) : 1;
+  let f = f0;
+  let phase = o.phase || 0;
+  let env = 1;
+  let vibP = 0;
+  const k = SINE_N / TAU;
+  for (let i = 0; i < n; i++) {
+    if (step !== 1) f *= step;
+    let fi = f;
+    if (vib) { vibP += vibStep; fi *= 1 + vib * Math.sin(vibP); }
+    phase += TAU * fi / SR;
+    if (phase >= TAU) phase -= TAU;
+    const ph = (phase * k) | 0;
+    let v = 0;
+    for (let h = 0; h < nh; h++) {
+      const mul = harm[h][0] | 0;
+      let idx = (ph * mul) % SINE_N;
+      v += harm[h][1] * SINE[idx];
+    }
+    env *= fall;
+    let e = env;
+    if (i < attN) e *= i / attN;
+    if (relN && i > n - relN) e *= (n - i) / relN;
+    const idx2 = t0 + i;
+    const j = wrap ? idx2 % len : idx2;
+    if (j < len) buf[j] += v * amp * e;
+  }
+}
+
+/* 노이즈(로우패스 계수 lp0→lp1로 스윘, hp면 하이패스) */
+function noise(buf, o) {
+  const t0 = Math.round((o.t || 0) * SR);
+  const dur = o.dur || 0.2;
+  const n = Math.round(dur * SR);
+  const amp = o.amp == null ? 0.2 : o.amp;
+  const attN = Math.max(1, Math.round((o.att == null ? 0.002 : o.att) * SR));
+  const decN = Math.max(1, (o.dec == null ? dur : o.dec) * SR);
+  const fall = Math.exp(-1 / decN);
+  const c0 = o.lp0 == null ? (o.lp == null ? 1 : o.lp) : o.lp0;
+  const c1 = o.lp1 == null ? c0 : o.lp1;
+  const dc = n > 1 ? (c1 - c0) / n : 0;
+  const hp = !!o.hp;
+  const relN = o.rel ? Math.round(o.rel * SR) : 0;
+  const wrap = o.wrap !== false;
+  const len = buf.length;
+  let lp = 0, lp2 = 0, env = 1, c = c0;
+  for (let i = 0; i < n; i++) {
+    const w = Math.random() * 2 - 1;
+    c += dc;
+    lp += (w - lp) * c;
+    let s = lp;
+    if (hp) { lp2 += (lp - lp2) * 0.02; s = (lp - lp2) * 2.4; }
+    env *= fall;
+    let e = env;
+    if (i < attN) e *= i / attN;
+    if (relN && i > n - relN) e *= (n - i) / relN;
+    const idx = t0 + i;
+    const j = wrap ? idx % len : idx;
+    if (j < len) buf[j] += s * amp * e;
+  }
+}
+
+/* 드럼 몇 가지 */
+function kick(buf, t, amp, o) {
+  o = o || {};
+  voice(buf, { t: t, dur: o.dur || 0.42, f: o.f || 152, f1: o.f1 || 44, dec: o.dec || 0.10,
+    att: 0.0015, amp: amp, harm: [[1, 1], [2, 0.16]], wrap: o.wrap });
+}
+function hat(buf, t, amp, open) {
+  noise(buf, { t: t, dur: open ? 0.18 : 0.06, amp: amp, att: 0.001,
+    dec: open ? 0.055 : 0.012, lp: 0.88, hp: true });
+}
+function snare(buf, t, amp) {
+  noise(buf, { t: t, dur: 0.2, amp: amp * 1.5, att: 0.001, dec: 0.055, lp: 0.75 });
+  voice(buf, { t: t, dur: 0.12, f: 196, f1: 150, dec: 0.045, amp: amp * 0.8, harm: [[1, 1], [2, 0.4]] });
+}
+function clap(buf, t, amp) {
+  [0, 0.011, 0.024, 0.038].forEach((d, i) => {
+    noise(buf, { t: t + d, dur: 0.14, amp: amp * (i === 3 ? 1.1 : 0.65), att: 0.001, dec: 0.035, lp: 0.82 });
+  });
+}
+
+/* 마무리: 정규화 + 부드러운 리미터 */
+function finish(buf, peak) {
+  let mx = 0;
+  for (let i = 0; i < buf.length; i++) { const a = buf[i] < 0 ? -buf[i] : buf[i]; if (a > mx) mx = a; }
+  if (mx < 1e-5) return buf;
+  const g = (peak || 0.84) / mx;
+  for (let i = 0; i < buf.length; i++) {
+    const v = buf[i] * g;
+    buf[i] = v / (1 + (v < 0 ? -v : v) * 0.22);
+  }
+  return buf;
+}
+/* 전체에 1차 로우패스(따뜻한 소리) */
+function soften(buf, cutoff) {
+  const c = 1 - Math.exp(-2 * Math.PI * cutoff / SR);
+  let y = 0;
+  for (let i = 0; i < buf.length; i++) { y += (buf[i] - y) * c; buf[i] = y; }
+  return buf;
+}
+
+/* ---------- 무료 BGM 5종 ---------- */
+function buildVlog() {
+  const bpm = 120, beat = 60 / bpm, bar = beat * 4, bars = 8;
+  const buf = new Float32Array(Math.round(bar * bars * SR));
+  const prog = [['C4', 'E4', 'G4'], ['G3', 'B3', 'D4'], ['A3', 'C4', 'E4'], ['F3', 'A3', 'C4']];
+  const seq = [0, 1, 2, 1, 0, 2, 1, 2];
+  for (let b = 0; b < bars; b++) {
+    const chord = prog[Math.floor(b / 2) % 4];
+    const t0 = b * bar;
+    chord.forEach((nn) => voice(buf, {
+      t: t0, f: hz(nn), dur: bar * 1.05, dec: bar * 1.1, amp: 0.055, att: 0.06,
+      harm: [[1, 1], [2, 0.16], [3, 0.05]]
+    }));
+    voice(buf, { t: t0, f: hz(chord[0]) / 2, dur: bar * 0.9, dec: 0.85, amp: 0.20, harm: [[1, 1], [2, 0.24]] });
+    voice(buf, { t: t0 + 2 * beat, f: hz(chord[0]) / 2, dur: bar * 0.45, dec: 0.5, amp: 0.15, harm: [[1, 1], [2, 0.22]] });
+    for (let i = 0; i < 8; i++) {
+      voice(buf, {
+        t: t0 + i * beat / 2, f: hz(chord[seq[i] % 3]) * 2, dur: 0.42, dec: 0.12,
+        amp: 0.085, harm: [[1, 1], [2, 0.32], [3, 0.10], [4, 0.04]]
+      });
+    }
+    for (let k = 0; k < 4; k++) {
+      const tt = t0 + k * beat;
+      if (k === 0 || k === 2) kick(buf, tt, 0.5);
+      if (k === 1 || k === 3) snare(buf, tt, 0.12);
+      hat(buf, tt + beat / 2, 0.06);
+      hat(buf, tt, 0.03);
+    }
+    if (b % 4 === 3) {
+      [0, 1, 2].forEach((i) => voice(buf, {
+        t: t0 + bar - beat + i * beat / 3, f: hz(chord[2]) * (i === 2 ? 4 : 2), dur: 0.5, dec: 0.16,
+        amp: 0.07, harm: [[1, 1], [2, 0.3], [3, 0.12]]
+      }));
+    }
+  }
+  return finish(buf, 0.82);
+}
+
+function buildLofi() {
+  const bpm = 75, beat = 60 / bpm, bar = beat * 4, bars = 4;
+  const buf = new Float32Array(Math.round(bar * bars * SR));
+  const prog = [['F3', 'A3', 'C4', 'E4'], ['E3', 'G3', 'B3', 'D4'], ['D3', 'F3', 'A3', 'C4'], ['C3', 'E3', 'G3', 'B3']];
+  for (let b = 0; b < bars; b++) {
+    const chord = prog[b % 4];
+    const t0 = b * bar;
+    [0, 2.5].forEach((bt, k) => {
+      chord.forEach((nn, i) => voice(buf, {
+        t: t0 + bt * beat + i * 0.012, f: hz(nn), dur: 2.4, dec: 1.15, amp: 0.075,
+        att: 0.01, harm: [[1, 1], [2, 0.30], [3, 0.10], [4, 0.05]]
+      }));
+      if (k === 1) chord.slice(1, 3).forEach((nn) => voice(buf, {
+        t: t0 + bt * beat + 0.02, f: hz(nn) * 2, dur: 1.6, dec: 0.7, amp: 0.035, att: 0.02,
+        harm: [[1, 1], [2, 0.2]]
+      }));
+    });
+    voice(buf, { t: t0, f: hz(chord[0]) / 2, dur: bar, dec: 1.5, amp: 0.17, harm: [[1, 1], [2, 0.2]] });
+    voice(buf, { t: t0 + 2.5 * beat, f: hz(chord[1]) / 2, dur: bar * 0.5, dec: 0.8, amp: 0.11 });
+    kick(buf, t0, 0.34, { dec: 0.12, f: 120 });
+    kick(buf, t0 + 2.5 * beat, 0.26, { dec: 0.12, f: 110 });
+    noise(buf, { t: t0 + 2 * beat, dur: 0.24, amp: 0.045, att: 0.002, dec: 0.07, lp: 0.45 });
+    for (let i = 0; i < 8; i++) hat(buf, t0 + i * beat / 2, i % 2 ? 0.016 : 0.026, false);
+  }
+  // 바이닐 잡음 + 살짝 흔들리는 피아노
+  noise(buf, { t: 0, dur: bar * bars, amp: 0.010, att: 0.4, dec: bar * bars, lp: 0.22, rel: 0.3 });
+  for (let i = 0; i < 26; i++) {
+    noise(buf, { t: Math.random() * bar * bars, dur: 0.02, amp: 0.03 + Math.random() * 0.03, att: 0.001, dec: 0.006, lp: 0.95, hp: true });
+  }
+  soften(buf, 3600);
+  return finish(buf, 0.78);
+}
+
+function buildPop() {
+  const bpm = 128, beat = 60 / bpm, bar = beat * 4, bars = 8;
+  const buf = new Float32Array(Math.round(bar * bars * SR));
+  const prog = [['C4', 'E4', 'G4'], ['G3', 'B3', 'D4'], ['A3', 'C4', 'E4'], ['F3', 'A3', 'C4']];
+  const saw = [[1, 1], [2, 0.52], [3, 0.34], [4, 0.24], [5, 0.17], [6, 0.12], [7, 0.08]];
+  for (let b = 0; b < bars; b++) {
+    const chord = prog[Math.floor(b / 2) % 4];
+    const t0 = b * bar;
+    for (let k = 0; k < 4; k++) {
+      const tt = t0 + k * beat;
+      kick(buf, tt, 0.52, { dec: 0.085 });
+      if (k === 1 || k === 3) clap(buf, tt, 0.16);
+      hat(buf, tt + beat / 2, 0.05, true);
+      hat(buf, tt, 0.03, false);
+      // 오프비트 신스 코드
+      chord.forEach((nn) => voice(buf, {
+        t: tt + beat / 2, f: hz(nn) * 2, dur: 0.3, dec: 0.14, amp: 0.035, att: 0.006, harm: saw
+      }));
+      // 베이스 8분
+      voice(buf, { t: tt + beat / 2, f: hz(chord[0]) / 2, dur: 0.3, dec: 0.16, amp: 0.16, harm: [[1, 1], [2, 0.3], [3, 0.12]] });
+    }
+    chord.forEach((nn) => voice(buf, {
+      t: t0, f: hz(nn) * 2, dur: bar * 0.9, dec: 0.6, amp: 0.03, att: 0.02, harm: saw
+    }));
+    voice(buf, { t: t0, f: hz(chord[0]) / 2, dur: bar * 0.45, dec: 0.4, amp: 0.14 });
+    // 리드 아르페지오 16분
+    for (let i = 0; i < 8; i++) {
+      voice(buf, {
+        t: t0 + i * beat / 2, f: hz(chord[i % 3]) * 4, dur: 0.22, dec: 0.1, amp: 0.045,
+        harm: [[1, 1], [2, 0.4], [3, 0.18]]
+      });
+    }
+  }
+  return finish(buf, 0.8);
+}
+
+function buildHiphop() {
+  const bpm = 92, beat = 60 / bpm, bar = beat * 4, bars = 4;
+  const buf = new Float32Array(Math.round(bar * bars * SR));
+  const prog = [['A3', 'C4', 'E4'], ['F3', 'A3', 'C4'], ['C3', 'E3', 'G3'], ['G3', 'B3', 'D4']];
+  for (let b = 0; b < bars; b++) {
+    const chord = prog[b % 4];
+    const t0 = b * bar;
+    chord.forEach((nn, i) => voice(buf, {
+      t: t0 + i * 0.01, f: hz(nn), dur: bar * 0.95, dec: 1.1, amp: 0.05, att: 0.02,
+      harm: [[1, 1], [2, 0.22], [3, 0.08]]
+    }));
+    // 808 베이스(글라이드)
+    voice(buf, { t: t0, dur: bar * 0.55, f: hz(chord[0]) / 2, f1: hz(chord[0]) / 2 * 0.94, dec: 0.55, amp: 0.34, harm: [[1, 1], [2, 0.28], [3, 0.08]] });
+    voice(buf, { t: t0 + 2.5 * beat, dur: bar * 0.4, f: hz(chord[0]) / 2, dec: 0.4, amp: 0.26, harm: [[1, 1], [2, 0.24]] });
+    kick(buf, t0, 0.44, { f: 130, dec: 0.13 });
+    kick(buf, t0 + 1.75 * beat, 0.4, { f: 120, dec: 0.12 });
+    kick(buf, t0 + 2.5 * beat, 0.36, { f: 120, dec: 0.12 });
+    snare(buf, t0 + 2 * beat, 0.2);
+    for (let i = 0; i < 8; i++) hat(buf, t0 + i * beat / 2, i % 2 ? 0.03 : 0.055, false);
+    if (b % 2 === 1) for (let i = 0; i < 4; i++) hat(buf, t0 + 3.5 * beat + i * beat / 4, 0.028, false);
+  }
+  return finish(buf, 0.8);
+}
+
+function buildCalm() {
+  const bpm = 60, beat = 60 / bpm, bar = beat * 4, bars = 4;
+  const buf = new Float32Array(Math.round(bar * bars * SR));
+  const prog = [['C3', 'G3', 'C4', 'E4'], ['A2', 'E3', 'A3', 'C4'], ['F2', 'C3', 'F3', 'A3'], ['G2', 'D3', 'G3', 'B3']];
+  for (let b = 0; b < bars; b++) {
+    const chord = prog[b % 4];
+    const t0 = b * bar;
+    chord.forEach((nn, i) => {
+      voice(buf, { t: t0 + i * 0.05, f: hz(nn), dur: bar * 2, dec: bar * 1.8, amp: 0.06, att: 1.3, harm: [[1, 1], [2, 0.14], [3, 0.04]] });
+      voice(buf, { t: t0 + i * 0.05, f: hz(nn) * 1.004, dur: bar * 2, dec: bar * 1.8, amp: 0.045, att: 1.5, harm: [[1, 1], [2, 0.10]] });
+    });
+    for (let i = 0; i < 4; i++) {
+      voice(buf, {
+        t: t0 + i * beat + 0.02, f: hz(chord[(i + 1) % chord.length]) * 4, dur: 1.5, dec: 0.5, amp: 0.028, att: 0.01,
+        harm: [[1, 1], [2, 0.25], [3, 0.08]]
+      });
+    }
+  }
+  noise(buf, { t: 0, dur: bar * bars, amp: 0.008, att: 2, dec: bar * bars, lp: 0.12, rel: 0.6 });
+  soften(buf, 5200);
+  return finish(buf, 0.76);
+}
+
+/* ---------- 무료 효과음 6종 ---------- */
+function sfxRing() {
+  const buf = new Float32Array(Math.round(1.4 * SR));
+  voice(buf, { t: 0, f: hz('E6'), dur: 1.2, dec: 0.34, amp: 0.34, att: 0.002, harm: [[1, 1], [2, 0.5], [3, 0.22], [4, 0.10], [5, 0.05]], wrap: false });
+  voice(buf, { t: 0.14, f: hz('B6'), dur: 1.1, dec: 0.30, amp: 0.22, att: 0.002, harm: [[1, 1], [2, 0.42], [3, 0.18]], wrap: false });
+  noise(buf, { t: 0, dur: 0.05, amp: 0.05, att: 0.001, dec: 0.012, lp: 0.9, hp: true, wrap: false });
+  return finish(buf, 0.9);
+}
+function sfxWhoosh() {
+  const buf = new Float32Array(Math.round(0.75 * SR));
+  noise(buf, { t: 0, dur: 0.7, amp: 0.5, att: 0.30, dec: 0.30, lp0: 0.05, lp1: 0.55, hp: true, rel: 0.12, wrap: false });
+  voice(buf, { t: 0.05, dur: 0.5, f: 900, f1: 220, amp: 0.06, att: 0.14, dec: 0.3, harm: [[1, 1], [2, 0.3]], wrap: false });
+  return finish(buf, 0.85);
+}
+function sfxPop() {
+  const buf = new Float32Array(Math.round(0.3 * SR));
+  voice(buf, { t: 0, dur: 0.16, f: 1100, f1: 240, dec: 0.045, amp: 0.6, att: 0.002, harm: [[1, 1], [2, 0.22]], wrap: false });
+  noise(buf, { t: 0, dur: 0.03, amp: 0.18, att: 0.001, dec: 0.008, lp: 0.9, hp: true, wrap: false });
+  return finish(buf, 0.92);
+}
+function sfxTada() {
+  const buf = new Float32Array(Math.round(1.9 * SR));
+  const notes = [['C5', 0], ['E5', 0.10], ['G5', 0.20], ['C6', 0.32]];
+  notes.forEach(([nn, t]) => voice(buf, {
+    t: t, f: hz(nn), dur: 1.4, dec: 0.45, amp: 0.22, att: 0.003,
+    harm: [[1, 1], [2, 0.45], [3, 0.2], [4, 0.1], [5, 0.05]], wrap: false
+  }));
+  ['E5', 'G5', 'C6', 'E6'].forEach((nn) => voice(buf, {
+    t: 0.32, f: hz(nn), dur: 1.2, dec: 0.7, amp: 0.075, att: 0.02, harm: [[1, 1], [2, 0.2]], wrap: false
+  }));
+  noise(buf, { t: 0.30, dur: 0.5, amp: 0.10, att: 0.005, dec: 0.16, lp: 0.85, hp: true, wrap: false });
+  return finish(buf, 0.9);
+}
+function sfxDun() {
+  const buf = new Float32Array(Math.round(2.2 * SR));
+  voice(buf, { t: 0, dur: 1.6, f: 104, f1: 33, dec: 0.55, amp: 0.55, att: 0.004, harm: [[1, 1], [2, 0.38], [3, 0.18]], wrap: false });
+  noise(buf, { t: 0, dur: 0.8, amp: 0.30, att: 0.004, dec: 0.18, lp0: 0.35, lp1: 0.05, wrap: false });
+  voice(buf, { t: 0.33, dur: 1.2, f: 78, f1: 34, dec: 0.45, amp: 0.16, att: 0.004, harm: [[1, 1], [2, 0.3]], wrap: false });
+  return finish(buf, 0.92);
+}
+function sfxBoing() {
+  const buf = new Float32Array(Math.round(0.7 * SR));
+  voice(buf, { t: 0, dur: 0.16, f: 240, f1: 760, dec: 0.12, amp: 0.34, att: 0.003, harm: [[1, 1], [2, 0.18]], wrap: false });
+  voice(buf, { t: 0.15, dur: 0.4, f: 780, f1: 300, dec: 0.16, amp: 0.3, att: 0.004, vib: 0.05, vibRate: 14, harm: [[1, 1], [2, 0.2]], wrap: false });
+  return finish(buf, 0.9);
+}
+
+/* ---------- 목록과 접근자 ---------- */
+const BGM_PRESETS = [
+  { key: 'vlog', name: '경쾌한 브이로그', desc: '120 BPM · 밝은 플럭 + 가벼운 드럼', build: buildVlog },
+  { key: 'lofi', name: '감성 로파이 피아노', desc: '75 BPM · 따뜻한 피아노 + 바이닐 잡음', build: buildLofi },
+  { key: 'pop', name: '신나는 팝 신스', desc: '128 BPM · 신스 코드 + 클랩', build: buildPop },
+  { key: 'hiphop', name: '힙한 리듬 비트', desc: '92 BPM · 808 베이스 + 트랩 햇', build: buildHiphop },
+  { key: 'calm', name: '차분한 앰비언트', desc: '60 BPM · 넓은 패드 + 잔잔한 벨', build: buildCalm }
+];
+const SFX_PRESETS = [
+  { key: 'ring', name: '띠링', desc: '알림 벨', build: sfxRing },
+  { key: 'whoosh', name: '휘릭', desc: '전환 우쉬', build: sfxWhoosh },
+  { key: 'pop', name: '팝', desc: '말풍선 톡', build: sfxPop },
+  { key: 'tada', name: '짠!', desc: '성공 팡파레', build: sfxTada },
+  { key: 'dun', name: '두둥', desc: '강조 임팩트', build: sfxDun },
+  { key: 'boing', name: '뿅', desc: '레트로 튕김', build: sfxBoing }
+];
+const BGM_MAP = {}, SFX_MAP = {};
+BGM_PRESETS.forEach((p) => { BGM_MAP[p.key] = p; });
+SFX_PRESETS.forEach((p) => { SFX_MAP[p.key] = p; });
+
+function rawFor(key) {
+  if (RAW[key]) return RAW[key];
+  const parts = key.split(':');
+  const map = parts[0] === 'bgm' ? BGM_MAP : SFX_MAP;
+  const def = map[parts[1]];
+  if (!def) return new Float32Array(SR * 0.1);
+  RAW[key] = def.build();
+  return RAW[key];
+}
+function audioBufferFor(key) {
+  if (!A.ctx) return null;
+  if (!ABUF[key]) {
+    const raw = rawFor(key);
+    const b = A.ctx.createBuffer(1, raw.length, SR);
+    b.getChannelData(0).set(raw);
+    ABUF[key] = b;
+  }
+  return ABUF[key];
+}
+
+/* 화면이 한가할 때 미리 합성해 두어 ‘듣기·적용’을 누를 때 바로 울리게 */
+let warmIdx = 0;
+function warmSounds() {
+  const list = BGM_PRESETS.map((p) => 'bgm:' + p.key).concat(SFX_PRESETS.map((p) => 'sfx:' + p.key));
+  const next = () => {
+    if (warmIdx >= list.length) return;
+    const key = list[warmIdx++];
+    try { rawFor(key); } catch (e) {}
+    setTimeout(next, 60);
+  };
+  setTimeout(next, 60);
+}
+
 /* ---------------- 4. 클립 ---------------- */
 function once(el, ev, ms) {
   return new Promise((resolve, reject) => {
@@ -151,6 +632,35 @@ function once(el, ev, ms) {
     const tm = setTimeout(fail, ms || 10000);
     el.addEventListener(ev, ok, { once: true });
   });
+}
+
+/* WebM·MediaRecorder로 만든 파일은 메타데이터에 길이가 없어 duration=Infinity로 나온다.
+   끝 지점으로 한 번 시크하면 브라우저가 실제 길이를 계산해 준다. */
+async function resolveDuration(video) {
+  if (isFinite(video.duration) && video.duration > 0) return video.duration;
+  await new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      video.removeEventListener('durationchange', check);
+      video.removeEventListener('timeupdate', check);
+      video.removeEventListener('loadeddata', check);
+      resolve();
+    };
+    const check = () => { if (isFinite(video.duration) && video.duration > 0) finish(); };
+    video.addEventListener('durationchange', check);
+    video.addEventListener('timeupdate', check);
+    video.addEventListener('loadeddata', check);
+    setTimeout(finish, 4000);
+    try { video.currentTime = 1e6; } catch (e) { finish(); }
+  });
+  const d = video.duration;
+  if (isFinite(d) && d > 0) {
+    try { video.currentTime = 0; } catch (e) {}
+    return d;
+  }
+  return 0;
 }
 
 async function addFiles(fileList) {
@@ -172,20 +682,21 @@ async function addFiles(fileList) {
     video.addEventListener('loadeddata', () => { if (!P.playing && !X.running) requestDraw(); });
     $('#videoBank').appendChild(video);
 
+    let dur = 0;
     try {
-      await once(video, 'loadedmetadata', 12000);
-      const d = video.duration;
-      if (!isFinite(d) || d <= 0) throw new Error('bad duration');
+      await once(video, 'loadedmetadata', 15000);
+      dur = await resolveDuration(video);
+      if (!(dur > 0)) throw new Error('bad duration');
     } catch (e) {
       toast('"' + file.name + '" 을(를) 읽지 못했어요. 다른 형식(MP4 권장)으로 변환해 주세요.', 4200);
       video.remove();
       URL.revokeObjectURL(url);
       continue;
     }
-    const dur = Math.max(0.3, video.duration);
+    const usable = Math.max(0.3, dur);
     const clip = {
       id: uid(), file, name: file.name, url, video,
-      duration: dur, trimStart: 0, trimEnd: dur, speed: 1, poster: '', __active: false
+      duration: usable, trimStart: 0, trimEnd: usable, speed: 1, poster: '', __active: false
     };
     S.clips.push(clip);
     attachVideoAudio(clip);
@@ -588,30 +1099,15 @@ function syncMedia(t, playing) {
     }
   });
 
-  // BGM
-  const el = A.bgmEl;
-  if (A.bgmGain) A.bgmGain.gain.value = P.muted && !X.running ? 0 : (S.audio.bgmVolume * bgmFade(t));
-  if (el) {
-    if (playing) {
-      if (el.paused) { const p = el.play(); if (p && p.catch) p.catch(() => {}); }
-      if (isFinite(el.duration) && el.duration > 0) {
-        const want = t % el.duration;
-        if (Math.abs(el.currentTime - want) > 0.45) { try { el.currentTime = want; } catch (e) {} }
-      }
-    } else {
-      if (!el.paused) el.pause();
-      if (isFinite(el.duration) && el.duration > 0) {
-        const want = Math.min(t % el.duration, el.duration - 0.05);
-        if (Math.abs(el.currentTime - want) > 0.1) { try { el.currentTime = Math.max(0, want); } catch (e) {} }
-      }
-    }
-  }
+  // BGM·효과음 게인(재생·내보내기 공통)
+  if (A.bgmGain) A.bgmGain.gain.value = (P.muted && !X.running) ? 0 : (S.audio.bgmVolume * bgmFade(t));
 }
 
 function startPlayback() {
   const { total } = layout();
   if (total <= 0) { toast('먼저 영상을 추가해 주세요.'); return; }
   if (X.running) return;
+  stopBgmPreview();
   ensureAudio();
   attachAllAudio();
   if (A.ctx && A.ctx.state === 'suspended') A.ctx.resume().catch(() => {});
@@ -620,6 +1116,7 @@ function startPlayback() {
   P.playing = true;
   P.base = P.time;
   P.t0 = performance.now();
+  audioStartAt(P.time);
   updatePlayBtn();
   tick();
 }
@@ -628,7 +1125,7 @@ function pausePlayback() {
   P.playing = false;
   cancelAnimationFrame(P.raf);
   resetVideos();
-  if (A.bgmEl && !A.bgmEl.paused) { try { A.bgmEl.pause(); } catch (e) {} }
+  audioStop();
   updatePlayBtn();
   drawFrame(previewCtx, PREVIEW_W, PREVIEW_H, P.time);
   updateTransport(P.time);
@@ -642,6 +1139,7 @@ function tick() {
     if (P.loop) {
       P.base = 0; P.t0 = performance.now(); t = 0;
       resetVideos();
+      audioStartAt(0);
     } else {
       P.time = total;
       syncMedia(total, false);
@@ -663,6 +1161,7 @@ function seekTo(t) {
   P.time = clamp(t, 0, total);
   P.base = P.time;
   P.t0 = performance.now();
+  if (P.playing) audioStartAt(P.time);
   if (!P.playing) syncMedia(P.time, false);
   drawFrame(previewCtx, PREVIEW_W, PREVIEW_H, P.time);
   updateTransport(P.time);
@@ -679,7 +1178,13 @@ function updateTransport(t) {
   const total = layout().total;
   const sc = $('#scrub');
   if (document.activeElement !== sc) sc.value = String(clamp(t, 0, Math.max(0.01, total)));
+  syncSfxTimeInput(t);
   updatePlayhead(t);
+}
+function syncSfxTimeInput(t) {
+  const el = $('#sfxTime');
+  if (!el || document.activeElement === el) return;
+  el.value = (Math.round(clamp(t || 0, 0, 999) * 10) / 10).toFixed(1);
 }
 function updatePlayhead(t) {
   const total = layout().total;
@@ -698,6 +1203,8 @@ function updateExpSummary(total) {
     '<li>길이 <b>' + fmtSec(total) + '</b>' + (total > LIMIT ? ' <span style="color:#ff8095">(40초 초과)</span>' : '') + '</li>' +
     '<li>해상도 <b>' + res + ' × ' + Math.round(res * 16 / 9) + '</b> · 9:16</li>' +
     '<li>형식 <b>' + label + '</b> · 이 브라우저가 지원하는 최상 형식</li>' +
+    '<li>사운드 <b>' + (AG.bgmBuffer ? (AG.bgmKind === 'preset' ? '내장 BGM' : '내 음악') : 'BGM 없음') +
+      ' · 효과음 <b>' + S.sfx.length + '개</b></li>' +
     '<li>예상 용량 <b>' + fmtSize(est) + '</b> 내외</li>';
 }
 
@@ -805,6 +1312,7 @@ function renderTimeline() {
     const w = clamp(((c.end - c.start) / total) * 100, 0.6, 100 - l);
     return '<div class="tlcap" style="left:' + l.toFixed(3) + '%;width:' + w.toFixed(3) + '%" title="' + escapeHtml(c.text) + '"></div>';
   }).join('') +
+  S.sfx.map((ev) => '<div class="tlsfx" style="left:' + clamp((ev.time / total) * 100, 0, 100).toFixed(3) + '%" title="효과음"></div>').join('') +
   (S.title.on && S.title.mode === 'intro' ? '<div class="tltitle" style="left:' + clamp((S.title.start / total) * 100, 0, 100).toFixed(3) + '%;width:' + clamp(((S.title.end - S.title.start) / total) * 100, 0.6, 100).toFixed(3) + '%"></div>' : '');
   updatePlayhead(P.time);
 }
@@ -839,6 +1347,9 @@ function refreshAll() {
   renderClips();
   renderClipProps();
   renderCaptions();
+  renderBgmLibrary();
+  renderSfxLibrary();
+  renderSfxList();
   renderTimeline();
   refreshTime();
   requestDraw();
@@ -893,38 +1404,181 @@ function updateCaptionFromEl(card, input) {
   requestDraw();
 }
 
-/* ---------------- 10. 미디어 선택 ---------------- */
-function pickBgmFile(file) {
-  if (!file) return;
-  if (S.audio.bgmUrl) URL.revokeObjectURL(S.audio.bgmUrl);
-  S.audio.bgmUrl = URL.createObjectURL(file);
-  S.audio.bgmName = file.name;
-  $('#bgmName').textContent = file.name;
-
-  if (A.bgmEl) {
-    try { A.bgmEl.pause(); } catch (e) {}
-    try { A.bgmEl.src = ''; } catch (e) {}
-  }
-  A.bgmSrc = null;
-  const el = new Audio();
-  el.src = S.audio.bgmUrl;
-  el.loop = true;
-  el.preload = 'auto';
-  A.bgmEl = el;
-  if (A.ctx) {
-    try {
-      A.bgmSrc = A.ctx.createMediaElementSource(el);
-      A.bgmSrc.connect(A.bgmGain);
-    } catch (e) {}
-  }
-  toast('배경음악: ' + file.name);
+/* ---------------- 10. 사운드: BGM·효과음 관리 ---------------- */
+function setBgm(buffer, name, kind, key) {
+  AG.bgmBuffer = buffer;
+  AG.bgmKind = kind || '';
+  AG.bgmKey = key || '';
+  S.audio.bgmName = name || '';
+  S.audio.bgmKind = kind || '';
+  S.audio.bgmPreset = key || '';
+  $('#bgmName').textContent = name || '선택 안 함';
+  if (P.playing) audioStartAt(P.time);
+  renderBgmLibrary();
+  updateExpSummary(layout().total);
 }
+
+async function pickBgmFile(file) {
+  if (!file) return;
+  const ctx = ensureAudio();
+  if (!ctx) { toast('이 브라우저에서는 소리를 쓸 수 없어요. 최신 Safari로 열어 주세요.', 5000); return; }
+  toast('음악을 불러오는 중…', 1600);
+  try {
+    const ab = await file.arrayBuffer();
+    const buf = await new Promise((resolve, reject) => {
+      let settled = false;
+      const done = (b) => { if (!settled) { settled = true; resolve(b); } };
+      const fail = (e) => { if (!settled) { settled = true; reject(e || new Error('decode')); } };
+      try {
+        const p = ctx.decodeAudioData(ab, done, fail);
+        if (p && p.then) p.then(done, fail);
+      } catch (e) { fail(e); }
+    });
+    setBgm(buf, file.name, 'file', '');
+    toast('배경음악: ' + file.name);
+  } catch (e) {
+    toast('음악 파일을 읽지 못했어요. MP3 · M4A · WAV 로 다시 시도해 주세요.', 5000);
+  }
+}
+
 function clearBgm() {
-  if (A.bgmEl) { try { A.bgmEl.pause(); } catch (e) {} A.bgmEl.src = ''; A.bgmEl = null; }
-  A.bgmSrc = null;
-  if (S.audio.bgmUrl) URL.revokeObjectURL(S.audio.bgmUrl);
-  S.audio.bgmUrl = ''; S.audio.bgmName = '';
-  $('#bgmName').textContent = '선택 안 함';
+  setBgm(null, '', '', '');
+  stopBgmPreview();
+  toast('BGM을 제거했어요.');
+}
+
+/* 내장 BGM 적용/해제 · 미리듣기 */
+let bgmPreview = null, bgmPreviewTimer = 0;
+function stopBgmPreview() {
+  if (bgmPreview) { stopNode(bgmPreview.src); try { bgmPreview.gain.disconnect(); } catch (e) {} bgmPreview = null; }
+  clearTimeout(bgmPreviewTimer);
+  $$('#bgmPresets [data-prev]').forEach((b) => { b.textContent = '▶'; b.classList.remove('on'); });
+}
+function toggleBgmPreview(key, btn) {
+  const wasSame = bgmPreview && bgmPreview.key === key;
+  stopBgmPreview();
+  if (wasSame) return;
+  const ctx = ensureAudio();
+  if (!ctx) { toast('이 브라우저에서는 미리듣기를 쓸 수 없어요.'); return; }
+  if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+  const buf = audioBufferFor('bgm:' + key);
+  if (!buf) return;
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.loop = true;
+  const g = ctx.createGain();
+  g.gain.value = clamp(S.audio.bgmVolume, 0.05, 1.5);
+  src.connect(g);
+  g.connect(A.master);
+  try { src.start(); } catch (e) { return; }
+  bgmPreview = { key: key, src: src, gain: g };
+  if (btn) { btn.textContent = '❚❚'; btn.classList.add('on'); }
+  bgmPreviewTimer = setTimeout(() => { stopBgmPreview(); }, 12000);
+}
+function applyBgmPreset(key) {
+  if (AG.bgmKind === 'preset' && AG.bgmKey === key) { clearBgm(); return; }
+  const ctx = ensureAudio();
+  if (!ctx) { toast('이 브라우저에서는 소리를 쓸 수 없어요. 최신 Safari로 열어 주세요.', 5000); return; }
+  stopBgmPreview();
+  const buf = audioBufferFor('bgm:' + key);
+  const def = BGM_MAP[key];
+  if (!buf || !def) return;
+  setBgm(buf, '무료 BGM · ' + def.name, 'preset', key);
+  toast('배경음악으로 ‘' + def.name + '’을 넣었어요.');
+}
+
+/* 효과음 */
+function addSfx(key) {
+  const def = SFX_MAP[key];
+  if (!def) return;
+  const { total } = layout();
+  if (total <= 0) { toast('먼저 영상을 추가해 주세요.'); return; }
+  let t = parseFloat(($('#sfxTime') || {}).value);
+  if (!isFinite(t)) t = P.time;
+  t = clamp(t, 0, total);
+  const ev = { id: uid(), key: key, time: Math.round(t * 10) / 10, vol: 0.8 };
+  S.sfx.push(ev);
+  S.sfx.sort((a, b) => a.time - b.time);
+  renderSfxList();
+  renderTimeline();
+  updateExpSummary(total);
+  if (P.playing) audioStartAt(P.time);
+  toast('‘' + def.name + '’ 효과음을 ' + fmtSec(ev.time) + ' 지점에 넣었어요.');
+}
+function removeSfx(id) {
+  S.sfx = S.sfx.filter((e) => e.id !== id);
+  renderSfxList();
+  renderTimeline();
+  updateExpSummary(layout().total);
+  if (P.playing) audioStartAt(P.time);
+}
+
+function renderBgmLibrary() {
+  const box = $('#bgmPresets');
+  if (!box) return;
+  if (!box.dataset.ready) {
+    box.innerHTML = BGM_PRESETS.map((p) =>
+      '<div class="presetItem" data-key="' + p.key + '">' +
+        '<div class="presetMain">' +
+          '<div class="presetName">' + escapeHtml(p.name) + '</div>' +
+          '<div class="presetDesc">' + escapeHtml(p.desc) + '</div>' +
+        '</div>' +
+        '<div class="presetOps">' +
+          '<button class="miniBtn" type="button" data-prev="' + p.key + '" title="미리듣기">▶</button>' +
+          '<button class="btn small applyBtn" type="button" data-apply="' + p.key + '">적용</button>' +
+        '</div>' +
+      '</div>'
+    ).join('');
+    box.dataset.ready = '1';
+  }
+  $$('.presetItem', box).forEach((el) => {
+    const on = AG.bgmKind === 'preset' && AG.bgmKey === el.dataset.key;
+    el.classList.toggle('on', on);
+    const b = el.querySelector('[data-apply]');
+    if (b) b.textContent = on ? '해제' : '적용';
+  });
+}
+
+function renderSfxLibrary() {
+  const box = $('#sfxPresets');
+  if (!box || box.dataset.ready) return;
+  box.innerHTML = SFX_PRESETS.map((p) =>
+    '<div class="presetItem" data-key="' + p.key + '">' +
+      '<div class="presetMain">' +
+        '<div class="presetName">' + escapeHtml(p.name) + '</div>' +
+        '<div class="presetDesc">' + escapeHtml(p.desc) + '</div>' +
+      '</div>' +
+      '<div class="presetOps">' +
+        '<button class="miniBtn" type="button" data-sfxplay="' + p.key + '" title="미리듣기">▶</button>' +
+        '<button class="btn small" type="button" data-sfxadd="' + p.key + '">추가</button>' +
+      '</div>' +
+    '</div>'
+  ).join('');
+  box.dataset.ready = '1';
+}
+
+function renderSfxList() {
+  const box = $('#sfxList');
+  if (!box) return;
+  const hint = $('#sfxEmptyHint');
+  if (hint) hint.hidden = S.sfx.length > 0;
+  box.innerHTML = S.sfx.map((ev) => {
+    const def = SFX_MAP[ev.key];
+    const v = Math.round((ev.vol == null ? 0.8 : ev.vol) * 100);
+    return '<div class="sfxItem" data-id="' + ev.id + '">' +
+      '<div class="sfxHead">' +
+        '<span class="sfxName">' + escapeHtml(def ? def.name : ev.key) + '</span>' +
+        '<span class="sfxAt">' + fmtClock(ev.time) + '</span>' +
+        '<button class="miniBtn" type="button" data-sfxact="play" title="미리듣기">▶</button>' +
+        '<button class="miniBtn del" type="button" data-sfxact="del" title="삭제">✕</button>' +
+      '</div>' +
+      '<label class="sliderRow"><span>볼륨</span>' +
+        '<input type="range" data-sfxvol="1" min="0" max="150" step="1" value="' + v + '">' +
+        '<output>' + v + '%</output>' +
+      '</label>' +
+      '<div class="pickRow"><button class="btn small ghost" type="button" data-sfxact="now">현재 위치로 옮기기</button></div>' +
+    '</div>';
+  }).join('');
 }
 
 /* ---------------- 11. 내보내기 ---------------- */
@@ -953,6 +1607,25 @@ function formatLabel(mime) {
   const vp8 = /vp8|vp08/i.test(mime);
   if (mp4) return 'MP4' + (h264 ? ' · H.264' : vp9 ? ' · VP9' : '');
   return 'WebM' + (vp9 ? ' · VP9' : vp8 ? ' · VP8' : '');
+}
+
+/* 내보낼 때마다 살아 있는 오디오 목적지를 보장한다.
+   (한 번 stop()된 MediaStreamTrack은 다시 쓸 수 없어 두 번째 내보내기가 무음이 되는 걸 막는다) */
+function freshAudioDest() {
+  const ctx = ensureAudio();
+  if (!ctx) return null;
+  let live = false;
+  try {
+    const tr = A.streamDest && A.streamDest.stream.getAudioTracks();
+    live = !!(tr && tr.length && tr[0].readyState === 'live');
+  } catch (e) { live = false; }
+  if (live) return A.streamDest;
+  try { A.master.disconnect(A.streamDest); } catch (e) {}
+  try {
+    A.streamDest = ctx.createMediaStreamDestination();
+    A.master.connect(A.streamDest);
+    return A.streamDest;
+  } catch (e) { return null; }
 }
 
 function setProgress(p, status) {
@@ -991,6 +1664,7 @@ async function doExport() {
   }
 
   pausePlayback();
+  stopBgmPreview();          // 미리듣기 중인 BGM이 녹음에 섞이지 않게
   primeVideosForIOS();
   ensureAudio();
   attachAllAudio();
@@ -1016,9 +1690,8 @@ async function doExport() {
     toast('이 브라우저에서는 캔버스 녹화를 지원하지 않아요. iOS는 Safari 최신 버전에서 시도해 주세요.', 6000);
     return;
   }
-  if (A.streamDest) {
-    A.streamDest.stream.getAudioTracks().forEach((tr) => { try { stream.addTrack(tr); } catch (e) {} });
-  }
+  const audioDest = freshAudioDest();
+  if (audioDest) audioDest.stream.getAudioTracks().forEach((tr) => { try { stream.addTrack(tr); } catch (e) {} });
 
   let rec;
   try {
@@ -1047,12 +1720,13 @@ async function doExport() {
   S.clips.forEach((c) => { c.__active = false; });
   drawFrame(ctx, W, H, 0);
 
-  const t0 = performance.now();
+  // BGM·효과음을 녹화 시작 시점에 맞춰 한 번에 예약(녹음 스트림으로도 그대로 흘러간다)
+  const t0 = audioStartAt(0, 0.07);
   await new Promise((resolve) => {
     const step = () => {
       if (X.cancel) { resolve(); return; }
       const el = (performance.now() - t0) / 1000;
-      const t = Math.min(el, total);
+      const t = clamp(el, 0, total);
       syncMedia(t, true);
       drawFrame(ctx, W, H, t);
       setProgress(t / total, '녹화 중… ' + Math.round((t / total) * 100) + '% · ' + fmtClock(t) + ' / ' + fmtClock(total));
@@ -1065,7 +1739,7 @@ async function doExport() {
   // 종료
   cancelAnimationFrame(X.raf);
   resetVideos();
-  if (A.bgmEl && !A.bgmEl.paused) { try { A.bgmEl.pause(); } catch (e) {} }
+  audioStop();
   setProgress(1, '마무리 중…');
   try { rec.stop(); } catch (e) {}
   await Promise.race([stopped, new Promise((r) => setTimeout(r, 4000))]);
@@ -1085,8 +1759,7 @@ async function doExport() {
   if (!blob.size || blob.size < 2000) {
     toast('영상이 만들어지지 않았어요. 다시 시도하거나 해상도를 낮춰 주세요.', 5000);
     return;
-  }
-  const ext = type.indexOf('mp4') >= 0 ? 'mp4' : 'webm';
+  }  const ext = type.indexOf('mp4') >= 0 ? 'mp4' : 'webm';
   const d = new Date();
   const stamp = d.getFullYear() + pad2(d.getMonth() + 1) + pad2(d.getDate()) + '-' + pad2(d.getHours()) + pad2(d.getMinutes());
   const name = 'shorts-' + stamp + '.' + ext;
@@ -1107,6 +1780,24 @@ async function doExport() {
   seekTo(0);
 }
 
+/* 내보내기 진입점: 어떤 예외가 나도 화면이 멈추지 않고 안내를 띄운다 */
+async function runExport() {
+  if (X.running) return;
+  try {
+    await doExport();
+  } catch (e) {
+    try { console.error(e); } catch (e2) {}
+    X.running = false;
+    X.cancel = false;
+    try { if (X.rec && X.rec.state !== 'inactive') X.rec.stop(); } catch (e2) {}
+    X.rec = null;
+    audioStop();
+    showExportModal(false);
+    $('#btnExport').disabled = false;
+    toast('내보내기가 막혔어요: ' + ((e && e.message) ? e.message : '알 수 없는 오류') + ' — 다시 시도하거나 해상도를 낮춰 주세요.', 6000);
+  }
+}
+
 /* ---------------- 12. 탭 ---------------- */
 function switchTab(name) {
   $$('#tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === name));
@@ -1116,11 +1807,18 @@ function switchTab(name) {
 
 /* ---------------- 13. 이벤트 배선 ---------------- */
 function bindUI() {
-  // 파일 선택
-  const fileInput = $('#fileInput');
-  const openPicker = () => fileInput.click();
-  ['#btnAddTop', '#btnAddClip', '#btnAddEmpty'].forEach((sel) => { const el = $(sel); if (el) el.onclick = openPicker; });
-  fileInput.onchange = (e) => { addFiles(e.target.files); fileInput.value = ''; };
+  // 파일 선택: 버튼(label) 위에 투명한 <input type=file>을 직접 덮어
+  // iOS Safari/PWA에서 .click()이 먹지 않는 문제를 없앨다
+  $$('.addFileBtn').forEach((label) => {
+    const inp = label.querySelector('input[type="file"]');
+    if (!inp) return;
+    inp.addEventListener('change', (e) => {
+      const fl = e.target.files;
+      if (inp.id === 'bgmInput') pickBgmFile(fl && fl[0]);
+      else addFiles(fl);
+      inp.value = '';
+    });
+  });
 
   // 드래그 앤 드롭
   const frame = $('#previewFrame');
@@ -1297,9 +1995,58 @@ function bindUI() {
   };
   $('#bgmFadeIn').oninput = (e) => { S.audio.bgmFadeIn = Math.max(0, parseFloat(e.target.value) || 0); };
   $('#bgmFadeOut').oninput = (e) => { S.audio.bgmFadeOut = Math.max(0, parseFloat(e.target.value) || 0); };
-  $('#btnBgmPick').onclick = () => $('#bgmInput').click();
-  $('#bgmInput').onchange = (e) => { pickBgmFile(e.target.files[0]); e.target.value = ''; };
   $('#btnBgmClear').onclick = clearBgm;
+
+  // 내장 무료 BGM
+  const bgmBox = $('#bgmPresets');
+  if (bgmBox) bgmBox.addEventListener('click', (e) => {
+    const p = e.target.closest('[data-prev]');
+    if (p) { toggleBgmPreview(p.dataset.prev, p); return; }
+    const a = e.target.closest('[data-apply]');
+    if (a) applyBgmPreset(a.dataset.apply);
+  });
+
+  // 내장 효과음
+  const sfxBox = $('#sfxPresets');
+  if (sfxBox) sfxBox.addEventListener('click', (e) => {
+    const p = e.target.closest('[data-sfxplay]');
+    if (p) { playSfxNow(p.dataset.sfxplay, 0.8); return; }
+    const a = e.target.closest('[data-sfxadd]');
+    if (a) addSfx(a.dataset.sfxadd);
+  });
+  $('#btnSfxNow').onclick = () => {
+    const el = $('#sfxTime');
+    if (el) el.value = (Math.round(P.time * 10) / 10).toFixed(1);
+    toast('효과음 위치를 ' + fmtSec(P.time) + '로 맞쳤어요.');
+  };
+  const sfxList = $('#sfxList');
+  sfxList.addEventListener('click', (e) => {
+    const item = e.target.closest('.sfxItem');
+    if (!item) return;
+    const ev = S.sfx.find((x) => x.id === item.dataset.id);
+    if (!ev) return;
+    const btn = e.target.closest('[data-sfxact]');
+    if (!btn) return;
+    const act = btn.dataset.sfxact;
+    if (act === 'del') { removeSfx(ev.id); return; }
+    if (act === 'play') { playSfxNow(ev.key, ev.vol); return; }
+    if (act === 'now') {
+      ev.time = Math.round(P.time * 10) / 10;
+      S.sfx.sort((a, b) => a.time - b.time);
+      renderSfxList();
+      renderTimeline();
+      if (P.playing) audioStartAt(P.time);
+    }
+  });
+  sfxList.addEventListener('input', (e) => {
+    const item = e.target.closest('.sfxItem');
+    if (!item) return;
+    const ev = S.sfx.find((x) => x.id === item.dataset.id);
+    if (!ev || !e.target.hasAttribute('data-sfxvol')) return;
+    ev.vol = clamp(parseFloat(e.target.value) / 100, 0, 1.5);
+    const out = e.target.parentElement.querySelector('output');
+    if (out) out.textContent = Math.round(parseFloat(e.target.value)) + '%';
+  });
   $('#mutePreview').onchange = (e) => {
     P.muted = e.target.checked;
     if (A.master) A.master.gain.value = P.muted ? 0 : 1;
@@ -1379,13 +2126,22 @@ function bindUI() {
   });
 
   // 내보내기
-  $('#btnExport').onclick = doExport;
-  $('#btnExportTop').onclick = () => { switchTab('export'); doExport(); };
+  $('#btnExport').onclick = () => { runExport(); };
+  $('#btnExportTop').onclick = () => {
+    switchTab('export');
+    if (!S.clips.length) {
+      toast('먼저 영상을 추가해 주세요. 위의 ‘+ 영상’을 누르면 됩니다.', 3200);
+      const el = $('#btnAddTop');
+      if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+      return;
+    }
+    runExport();
+  };
 
   $('#expRes').onchange = () => updateExpSummary(layout().total);
   $('#expFps').onchange = () => updateExpSummary(layout().total);
   $('#expCancel').onclick = () => { X.cancel = true; };
-  $('#btnExportAgain').onclick = () => { doExport(); };
+  $('#btnExportAgain').onclick = () => { runExport(); };
 
   // 키보드
   window.addEventListener('keydown', (e) => {
@@ -1425,7 +2181,12 @@ function init() {
   refreshAll();
   drawFrame(previewCtx, PREVIEW_W, PREVIEW_H, 0);
   // 콘솔에서 상태를 확인할 수 있게(디버그용)
-  window.__shortsEditor = { S, A, P, layout, drawFrame, seekTo, refreshAll, drawPreview: requestDraw };
+  window.__shortsEditor = {
+    S, A, AG, P, layout, drawFrame, seekTo, refreshAll, drawPreview: requestDraw,
+    applyBgmPreset, addSfx, playSfxNow, audioStartAt, rawFor, audioBufferFor, BGM_PRESETS, SFX_PRESETS
+  };
+  // 내장 사운드는 백그라운드에서 미리 합성(첫 탭 때 지연 없게)
+  setTimeout(warmSounds, 900);
 }
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
